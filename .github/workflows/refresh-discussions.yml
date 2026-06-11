@@ -18,12 +18,9 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies
-        run: npm install --no-audit --no-fund
-
-      - name: Install Chromium
-        run: npx playwright install --with-deps chromium
-
+      # No credentials/deps needed — the script scrapes old.reddit's HTML.
+      # If GitHub's datacenter IPs ever start getting 403'd, the job fails
+      # without overwriting data; run `npm run fetch` locally and commit.
       - name: Fetch discussions
         run: node scripts/fetch-reddit.js
 

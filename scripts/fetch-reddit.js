@@ -1,15 +1,20 @@
 // Fetches r/UlcerativeColitis discussions for every item and writes
-// data/discussions.json. Run by the scheduled GitHub Action.
+// data/discussions.json. Run by the scheduled GitHub Action (and runnable
+// locally — see README).
 //
-// Reddit now blocks bare HTTP clients (curl / fetch / URLSession / OkHttp) with
-// an anti-bot filter — only a real browser engine passes. So we drive headless
-// Chromium (Playwright), load a real reddit.com page, and run the search
-// requests *from inside that page's context* so they carry the browser's
-// fingerprint and session cookies. No Reddit app / API key required.
+// Reddit walls its JSON API endpoints (.json / oauth.reddit.com) behind an
+// anti-bot 403 for anonymous clients, and registering an API app requires
+// account privileges we don't have. BUT the legacy server-rendered search
+// page at old.reddit.com still returns full HTML (200) with everything we
+// need — title, permalink, author, score and comment count — and needs no
+// credentials. So we fetch that HTML and parse the search-result markup.
+//
+// Note: Reddit blocks datacenter IP ranges harder than residential ones. If a
+// GitHub Actions run starts returning 403, run this script locally instead
+// (`npm run fetch`) and commit the refreshed data/discussions.json.
 
 const fs = require("fs");
 const path = require("path");
-const { chromium } = require("playwright");
 const items = require("./items");
 
 const LIMIT = 5; // posts per item
@@ -21,71 +26,100 @@ const UA =
 const normalize = (s) => s.toLowerCase().trim().replace(/\s+/g, " ");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function searchInPage(page, query) {
-  const data = await page.evaluate(async ({ q, limit }) => {
-    const url =
-      "/r/UlcerativeColitis/search.json?" +
-      new URLSearchParams({
-        q,
-        restrict_sr: "1",
-        sort: "top",
-        t: "all",
-        limit: String(limit),
-        raw_json: "1",
-      });
-    try {
-      const res = await fetch(url, { headers: { Accept: "application/json" } });
-      if (!res.ok) return { error: res.status };
-      return await res.json();
-    } catch (e) {
-      return { error: String(e) };
-    }
-  }, { q: query, limit: LIMIT });
+// Decode the handful of HTML entities old.reddit emits in titles/usernames.
+function decode(s) {
+  return (s || "")
+    .replace(/&#32;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&#x27;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(+n))
+    .trim();
+}
 
-  if (data.error) {
-    console.error(`  search failed for "${query}": ${data.error}`);
+// Pull each <div class="search-result-link ..."> block out of the page.
+function parseSearch(html) {
+  const blocks = html.split("search-result-link").slice(1);
+  const posts = [];
+
+  for (const block of blocks) {
+    const title = block.match(
+      /class="[^"]*search-title[^"]*"[^>]*>([^<]+)</
+    );
+    const href = block.match(
+      /<a href="(https:\/\/old\.reddit\.com\/r\/[^"]+\/comments\/[^"]+)"[^>]*class="[^"]*search-title/
+    );
+    if (!title || !href) continue;
+
+    const scoreM = block.match(/class="search-score">([\d,]+)\s*points?</);
+    const commentsM = block.match(/search-comments[^>]*>\s*([\d,]+)\s*comments?</);
+    const authorM = block.match(
+      /<a href="https:\/\/old\.reddit\.com\/user\/[^"]+"[^>]*class="author[^"]*"[^>]*>([^<]+)</
+    );
+
+    const toNum = (m) => (m ? parseInt(m[1].replace(/,/g, ""), 10) : 0);
+
+    posts.push({
+      title: decode(title[1]),
+      author: authorM ? decode(authorM[1]) : "unknown",
+      score: toNum(scoreM),
+      commentCount: toNum(commentsM),
+      // Canonicalize to www.reddit.com so the apps open the normal site.
+      url: href[1].replace("old.reddit.com", "www.reddit.com"),
+      preview: "", // search HTML has no body text; cards handle empty preview
+    });
+
+    if (posts.length >= LIMIT) break;
+  }
+  return posts;
+}
+
+async function search(query) {
+  const url =
+    "https://old.reddit.com/r/UlcerativeColitis/search?" +
+    new URLSearchParams({
+      q: query,
+      restrict_sr: "on",
+      sort: "top",
+      t: "all",
+      include_over_18: "on",
+    });
+
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: {
+        "User-Agent": UA,
+        Accept: "text/html,application/xhtml+xml",
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+      redirect: "follow",
+    });
+  } catch (e) {
+    console.error(`  search failed for "${query}": ${e.message || e}`);
     return [];
   }
-  const children = data?.data?.children || [];
-  return children.map((c) => {
-    const d = c.data;
-    return {
-      title: d.title,
-      author: d.author,
-      score: d.score,
-      commentCount: d.num_comments,
-      url: `https://www.reddit.com${d.permalink}`,
-      preview: (d.selftext || "").slice(0, 200),
-    };
-  });
+  if (!res.ok) {
+    console.error(`  search failed for "${query}": ${res.status}`);
+    return [];
+  }
+  return parseSearch(await res.text());
 }
 
 async function main() {
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ userAgent: UA, locale: "en-US" });
-  const page = await context.newPage();
-
-  // Load a real subreddit page first so subsequent fetches share its
-  // origin, cookies and browser fingerprint.
-  await page.goto("https://www.reddit.com/r/UlcerativeColitis/", {
-    waitUntil: "domcontentloaded",
-    timeout: 60000,
-  });
-  await sleep(3000);
-
   const out = { generatedAt: new Date().toISOString(), items: {} };
   let ok = 0;
 
   for (const item of items) {
-    const posts = await searchInPage(page, item.query);
+    const posts = await search(item.query);
     if (posts.length) ok++;
     const keys = [item.query, ...(item.aliases || [])].map(normalize);
     for (const k of keys) out.items[k] = posts;
     console.log(`  ${item.query} -> ${posts.length} posts`);
-    await sleep(1200);
+    await sleep(1500); // be gentle; avoid tripping rate limits
   }
-
-  await browser.close();
 
   if (ok === 0) {
     throw new Error("All searches returned 0 posts — refusing to write empty data.");
