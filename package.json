@@ -1,0 +1,12 @@
+{
+  "name": "ucinsights-data",
+  "version": "1.0.0",
+  "private": true,
+  "type": "commonjs",
+  "scripts": {
+    "fetch": "node scripts/fetch-reddit.js"
+  },
+  "dependencies": {
+    "playwright": "^1.48.0"
+  }
+}

@@ -18,10 +18,13 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
       - name: Fetch discussions
-        env:
-          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         run: node scripts/fetch-reddit.js
 
       - name: Commit if changed
